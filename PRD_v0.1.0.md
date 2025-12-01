@@ -128,7 +128,7 @@ graph TD
 
 ## 3\. Detailed Functional Requirements
 
-### 3.1 The Wire Protocol Parser (The "Magic")
+### 3.1 The Wire Protocol Parser
 
   * **Requirement:** Prism must implement a partial PostgreSQL frontend *and* backend.
   * **Mechanism:**
