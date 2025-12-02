@@ -8,7 +8,6 @@ func ExtractBranch(fullUsername string) (string, string) {
 	}
 
 	parts := strings.Split(fullUsername, "@")
-	// Handle edge case: "postgres@" -> user: postgres, branch: master
 	if len(parts) == 2 && parts[1] == "" {
 		return parts[0], "master"
 	}

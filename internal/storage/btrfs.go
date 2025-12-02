@@ -8,7 +8,7 @@ import (
 )
 
 type BtrfsDriver struct {
-	BasePath string // for example, "/mnt/prism_data"
+	BasePath string
 }
 
 func NewBtrfsDriver(basePath string) *BtrfsDriver {
@@ -28,7 +28,7 @@ func (d *BtrfsDriver) Init() error {
 
 func (d *BtrfsDriver) CreateSnapshot(sourceID string) (string, error) {
 	src := filepath.Join(d.BasePath, sourceID)
-	snapName := fmt.Sprintf("snap_%s", sourceID) // simplistic naming for now
+	snapName := fmt.Sprintf("snap_%s", sourceID)
 	dst := filepath.Join(d.BasePath, snapName)
 
 	cmd := exec.Command("sudo", "btrfs", "subvolume", "snapshot", "-r", src, dst)
