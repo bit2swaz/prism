@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -150,6 +151,23 @@ func handleConnection(clientConn net.Conn, logger *slog.Logger, driver *storage.
 
 	logger.Info("Startup Packet Sent")
 	logger.Info("Proxying Traffic", "client", remoteAddr, "backend", containerIP)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				mgr.Touch(branchID)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	Pipe(clientConn, backendConn)
 }
 
