@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"time"
 
@@ -30,6 +32,22 @@ func main() {
 		logger.Error("Docker Engine Init failed", "error", err)
 		os.Exit(1)
 	}
+
+	dockerMgr.StartReaper(10*time.Second, 30*time.Second, logger)
+	logger.Info("Reaper Activated", "idle_timeout", "30s")
+
+	go func() {
+		http.HandleFunc("/branches", func(w http.ResponseWriter, r *http.Request) {
+			branches := dockerMgr.ListBranches()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(branches)
+		})
+
+		logger.Info("Management API Live", "port", "8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			logger.Error("API Server failed", "error", err)
+		}
+	}()
 
 	listener, err := net.Listen("tcp", "0.0.0.0:"+port)
 	if err != nil {
