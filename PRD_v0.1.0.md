@@ -5,9 +5,9 @@
 | Field | Value |
 | :--- | :--- |
 | **Project** | **Prism** (formerly Ephemeral DB Proxy) |
-| **Version** | v0.1.0-alpha (The "Foundation" Release) |
+| **Version** | **v0.1.0-alpha** (The "Foundation" Release) |
 | **Owner** | Aditya Mishra (`@bit2swaz`) |
-| **Status** | **APPROVED FOR IMPLEMENTATION** |
+| **Status** | **COMPLETED / GOLD MASTER** |
 | **Type** | Infrastructure-as-Code / Database Middleware |
 | **Core Stack** | Go (TCP/Net), Postgres Wire Protocol, Docker SDK, Btrfs (Dev), ZFS (Prod) |
 
@@ -15,21 +15,19 @@
 
 ## 1\. Executive Summary
 
-### 1.1 The Problem
+### 1.1 The Vision
 
-In modern CI/CD, the database is the bottleneck. While code is branched via Git and builds are cached via VelocityCache, the database remains a monolithic, shared resource ("Staging DB").
+To democratize "Database Branching." Current solutions (Neon, PlanetScale) lock users into specific cloud vendors. **Prism** is the open-source middleware that brings **serverless, instant-branching capabilities** to *any* self-hosted PostgreSQL instance.
 
-  * **Collision:** Developer A runs a migration that breaks Developer B's code.
-  * **Latency:** Recreating a DB for tests takes minutes (dump/restore).
-  * **Vendor Lock-in:** Solutions like Neon or PlanetScale offer branching but require migrating data to their cloud.
+### 1.2 Core Value Proposition
 
-### 1.2 The Solution: Prism
-
-Prism is a **self-hosted, protocol-aware reverse proxy** for PostgreSQL. It sits between your application and your database storage. By intercepting the PostgreSQL Wire Protocol, Prism detects branch contexts (e.g., via `postgres@feature-1`) and uses a **Polymorphic Storage Engine** to spin up an isolated, read-write clone of the production database in milliseconds using filesystem-level Copy-on-Write (CoW).
+  * **Speed:** Branch a 1TB database in \< 500ms using Copy-on-Write (CoW).
+  * **Privacy:** Data never leaves your VPC (unlike SaaS alternatives).
+  * **Cost:** "Scale-to-Zero" architecture. Unused branches consume $0 compute (RAM/CPU).
 
 ### 1.3 The "Resume" Objective
 
-To demonstrate mastery of:
+Demonstrate mastery of:
 
 1.  **Systems Programming:** Custom TCP/Packet Parsing and OS-level File Descriptor management.
 2.  **Storage Engines:** Abstracting filesystem primitives (ZFS vs Btrfs) behind a unified Go interface.
@@ -42,6 +40,8 @@ To demonstrate mastery of:
 Prism operates on two planes: the **Data Plane** (Hot Path) which shuffles packets, and the **Control Plane** (Cold Path) which manages infrastructure.
 
 ### 2.1 High-Level Data Flow
+
+[Image of prism architecture data flow diagram]
 
 ```mermaid
 sequenceDiagram
@@ -96,6 +96,8 @@ graph TD
             
             Orchestrator[Infrastructure Orchestrator] -.->|Manages| Docker[Docker SDK]
             Orchestrator -.->|Uses| StorageInterface{Storage Interface}
+            Reaper[Background Reaper] -.->|Monitors| Orchestrator
+            API[HTTP API :8080] -.->|Queries| Orchestrator
         end
 
         subgraph "Storage Implementation"
@@ -128,13 +130,13 @@ graph TD
 
 ## 3\. Detailed Functional Requirements
 
-### 3.1 The Wire Protocol Parser
+### 3.1 The Wire Protocol Parser (The "Magic")
 
   * **Requirement:** Prism must implement a partial PostgreSQL frontend *and* backend.
   * **Mechanism:**
     1.  **Peek:** Read the first 8 bytes of the incoming TCP stream.
-    2.  **Length Check:** Bytes 0-3 (Int32) determine packet size.
-    3.  **Protocol Version:** Bytes 4-7.
+    2.  **Length Check:** Bytes 0-3 (Int32 Big Endian) determine packet size.
+    3.  **Protocol Version:** Bytes 4-7 (Int32 Big Endian).
           * If `80877103` (SSLRequest): Reply `N` byte immediately. **Constraint:** v0.1.0 strictly enforces `sslmode=disable`.
           * If `00030000` (StartupMessage): Parse the Key-Value pairs.
     4.  **Extraction:** Extract `user` string. Split by `@`.
@@ -167,29 +169,23 @@ type Driver interface {
   * **Implementation:** Executes `exec.Command("btrfs", "subvolume", "snapshot", src, dst)`.
   * **Mounting:** Returns the path `/mnt/prism_data/branches/<id>` which Docker binds.
 
-#### 3.2.3 The ZFS Driver (Production)
-
-  * **Strategy:** Uses `zfs snapshot` and `zfs clone`.
-  * **Why:** True enterprise-grade data integrity, compression, and ARC caching.
-  * **Implementation:** Executes `zfs clone pool/snaps/<id> pool/branches/<id>`.
-
 ### 3.3 Connection Holding (The UX Polish)
 
   * **Problem:** Docker takes \~500ms to start. Clients timeout.
   * **Solution:** **TCP Flow Control.**
       * When a branch is missing, Prism pauses reading from the *client socket*.
       * It initiates the orchestrator.
-      * It periodically sends TCP Keep-Alives.
-      * Once the backend is healthy, it flushes the buffered StartupMessage to the new backend.
+      * Once the backend is healthy, it manually constructs and sends the `StartupMessage` to the backend (since the bytes were consumed during parsing).
       * **Result:** The user sees a slight "lag" on the first connection, but no error.
 
 ### 3.4 The "Reaper" (Garbage Collection)
 
   * **Requirement:** Prevent 16GB RAM exhaustion.
   * **Logic:**
-      * Background ticker (1 min).
-      * **Pause:** If `active_connections == 0` for \> 15 mins, `docker stop <container>`. (Data preserved).
-      * **Purge:** If stopped for \> 24 hours, `btrfs subvolume delete <path>`. (Data destroyed).
+      * **Structure:** `map[string]time.Time` tracks `LastActive` timestamps.
+      * **Loop:** Background ticker (10s for dev, 15m for prod).
+      * **Pause:** If `now - LastActive > Threshold`, call `docker stop <container>`.
+      * **Result:** Data is preserved on disk, but RAM is freed.
 
 -----
 
@@ -199,32 +195,80 @@ Your hardware is powerful but memory-constrained. The architecture is tuned spec
 
 | Resource | Constraint | Optimization Strategy |
 | :--- | :--- | :--- |
-| **RAM** | 16 GB Total | **1. System Clamp:** `.wslconfig` limits VM to 6GB.<br>**2. DB Clamp:** Inject `postgresql.conf` with `shared_buffers=128MB`.<br>**3. Driver Clamp:** Btrfs uses OS page cache (shared with Windows), unlike ZFS ARC. This is safer for WSL2. |
+| **RAM** | 16 GB Total | **1. System Clamp:** `.wslconfig` limits VM to 6GB.<br>**2. Reaper:** Aggressively stops idle containers.<br>**3. Driver Clamp:** Btrfs uses OS page cache (shared with Windows), unlike ZFS ARC. This is safer for WSL2. |
 | **Storage** | 1TB NVMe | **Loopback Isolation:** We create a 20GB file (`disk.img`) and format it as Btrfs. This prevents Prism from flooding your main Windows drive with small files. |
-| **CPU** | Ryzen 7 (8c/16t) | Go routines will utilize all cores. We can handle high concurrency easily. |
+| **Networking**| WSL2 Bridge | **Port Mapping Hack:** We map container port 5432 to a random Host Port (`127.0.0.1:0`) to bypass WSL2's internal routing restrictions. |
 
 -----
 
-## 5\. Roadmap & Phasing
+## 5\. Development Roadmap Status
 
-### Phase 1: The "Btrfs Lab" (Day 1-2)
+### Phase 1: The "Btrfs Lab" (Foundation)
 
-  * **Objective:** Prove filesystem physics.
-  * **Deliverable:** A Btrfs loopback file mounted in WSL2 that can snapshot a 1GB folder in \< 50ms.
-  * **Verification:** Run the `time` command on a manual snapshot.
+  * **Goal:** Prove filesystem physics.
+  * **Status:** ✅ **DONE**
+  * **Deliverable:** Validated Btrfs loopback mount capable of snapshots in \< 25ms.
 
-### Phase 2: The "Socket Plumber" (Day 3-4)
+### Phase 2: The "Socket Plumber" (Network)
 
-  * **Objective:** Connect Client -\> Prism -\> Docker.
-  * **Deliverable:** A Go binary that listens on 5432, parses the user, and blindly proxies traffic to a pre-existing container.
-  * **Verification:** Connect `psql` to Prism and run `SELECT 1`.
+  * **Goal:** Connect Client -\> Prism -\> Docker.
+  * **Status:** ✅ **DONE**
+  * **Deliverable:** Go binary listening on 5432 that parses `postgres@branch`.
 
-### Phase 3: The "Orchestrator" (Day 5-7)
+### Phase 3: The "Orchestrator" (Core Logic)
 
-  * **Objective:** Dynamic Creation.
-  * **Deliverable:** Integration of the Storage Driver. When a user connects to `non_existent_branch`, Prism calls `btrfs snapshot` -\> `docker run`.
-  * **Verification:** Connect to `postgres@new-feature` and see a new container spin up automatically.
+  * **Goal:** Dynamic Creation.
+  * **Status:** ✅ **DONE**
+  * **Deliverable:** Integration of `btrfs snapshot` -\> `docker run` -\> `net.Dial`.
 
-----
+### Phase 4: The "Control Plane" (Management)
 
-*Working on it ^^*
+  * **Goal:** Operational Maturity.
+  * **Status:** ✅ **DONE**
+  * **Deliverable:**
+      * Background Reaper (Auto-Kill).
+      * HTTP API (`GET /branches`) on port 8080.
+
+-----
+
+## 6\. Deployment Guide (Quickstart)
+
+### Prerequisites
+
+  * **OS:** Linux or WSL2 (Ubuntu 22.04+).
+  * **Dependencies:** `docker`, `btrfs-progs`, `go 1.21+`.
+  * **Root Access:** Required for `mount` and `btrfs` commands.
+
+### Setup
+
+1.  **Initialize Storage:**
+
+    ```bash
+    # Create 10GB Virtual Disk
+    dd if=/dev/zero of=disk.img bs=1G count=10
+    mkfs.btrfs disk.img
+    mount -o loop disk.img /mnt/prism_data
+
+    # Create Gold Master
+    btrfs subvolume create /mnt/prism_data/master
+    # Populate master with initial DB data using a temp container...
+    ```
+
+2.  **Build & Run:**
+
+    ```bash
+    go build -o prism cmd/prism/main.go
+    sudo ./prism
+    ```
+
+3.  **Connect:**
+
+    ```bash
+    psql "host=localhost port=5432 user=postgres@new-feature password=password sslmode=disable"
+    ```
+
+4.  **Manage:**
+
+    ```bash
+    curl http://localhost:8080/branches
+    ```
